@@ -72,7 +72,8 @@ int main(int argc, char **argv) {
     /* ---- Parse arguments ---- */
     const char *input  = NULL;
     const char *output = NULL;
-    int flag_S = 0, flag_c = 0;
+    int flag_S = 0, flag_c = 0, flag_32b = 0;
+    int flag_nostdlib = 0, flag_freestanding = 0;
     int flag_early = 0;   /* -E / -dump-tokens / -dump-ast: stop after compiler */
 
     /* args forwarded to compiler_main */
@@ -98,6 +99,19 @@ int main(int argc, char **argv) {
             if (++i < argc) cc[ncc++] = argv[i];
         } else if (!strncmp(argv[i], "-I", 2)) {
             cc[ncc++] = argv[i];
+        } else if (!strcmp(argv[i], "-m32") || !strcmp(argv[i], "-32b")) {
+            flag_32b = 1;
+            cc[ncc++] = (char*)"-m32";
+        } else if (!strcmp(argv[i], "-ffreestanding")) {
+            flag_freestanding = 1;
+            cc[ncc++] = argv[i];
+        } else if (!strcmp(argv[i], "-nostdlib")) {
+            flag_nostdlib = flag_freestanding = 1;
+            cc[ncc++] = (char*)"-ffreestanding";
+            cc[ncc++] = (char*)"-nostdlib";
+        } else if (!strncmp(argv[i], "-O", 2)) {
+            /* optimization level — forwarded to compiler (no-op there too) */
+            cc[ncc++] = argv[i];
         } else if (argv[i][0] != '-') {
             input = argv[i];
         } else {
@@ -109,11 +123,15 @@ int main(int argc, char **argv) {
     if (!input) {
         fprintf(stderr,
             "Usage: neutron [options] input.c [-o output]\n"
-            "  -S           stop after compilation (.asm)\n"
-            "  -c           stop after assembly    (.o)\n"
-            "  -E           preprocess only\n"
-            "  -o <file>    output filename\n"
-            "  -I <path>    add include path\n");
+            "  -m32              target 32-bit i386\n"
+            "  -ffreestanding    no hosted include paths\n"
+            "  -nostdlib         skip crt0/boot objects at link\n"
+            "  -O0/-O1/-O2/-O3   optimization level (no-op)\n"
+            "  -S                stop after compilation (.asm)\n"
+            "  -c                stop after assembly    (.o)\n"
+            "  -E                preprocess only\n"
+            "  -o <file>         output filename\n"
+            "  -I <path>         add include path\n");
         return 1;
     }
     if (!output) output = "a.out";
@@ -138,29 +156,76 @@ int main(int argc, char **argv) {
     if (ret != 0 || flag_early || flag_S) return ret;
 
     /* ================================================================
-     * Stage 2 — Assemble  .asm → .o   (via Proton subprocess)
+     * Stage 2 — Assemble  .asm → .o
+     * 64-bit: Proton  (-f elf64)
+     * 32-bit: NASM    (-f elf32)  — Proton's elf32 is broken
      * ================================================================ */
     const char *obj_out = flag_c ? output : obj_tmp;
 
-    char *as_args[] = { proton, (char*)"-f", (char*)"elf64",
-                        (char*)asm_out, (char*)"-o", (char*)obj_out, NULL };
+    char *as_args[16];
+    if (flag_32b) {
+        as_args[0] = (char*)"/usr/bin/nasm";
+        as_args[1] = (char*)"-f"; as_args[2] = (char*)"elf32";
+        as_args[3] = (char*)asm_out;
+        as_args[4] = (char*)"-o"; as_args[5] = (char*)obj_out;
+        as_args[6] = NULL;
+    } else {
+        as_args[0] = proton;
+        as_args[1] = (char*)"-f"; as_args[2] = (char*)"elf64";
+        as_args[3] = (char*)asm_out;
+        as_args[4] = (char*)"-o"; as_args[5] = (char*)obj_out;
+        as_args[6] = NULL;
+    }
     ret = spawn(as_args);
     unlink(asm_out);
     if (ret != 0) { fprintf(stderr, "neutron: assembler failed\n"); return ret; }
     if (flag_c)   return 0;
 
     /* ================================================================
-     * Stage 3 — Link   .o → executable   (neutron-ld logic, in-process)
+     * Stage 3 — Link   .o → executable
+     * -nostdlib / -ffreestanding: link only the user object, no boot files
+     * 32-bit hosted:   system ld -m elf_i386 + crt0_32 + printf_32
+     * 64-bit hosted:   neutron-ld + crt0/crti/crtn/printf
      * ================================================================ */
-    char crt0[512], crti[512], crtn[512], prtf[512];
-    snprintf(crt0, sizeof crt0, "%s/crt0.o",   boot_dir);
-    snprintf(crti, sizeof crti, "%s/crti.o",   boot_dir);
-    snprintf(crtn, sizeof crtn, "%s/crtn.o",   boot_dir);
-    snprintf(prtf, sizeof prtf, "%s/printf.o", boot_dir);
+    if (flag_nostdlib || flag_freestanding) {
+        /* Bare-metal / freestanding: user is responsible for everything */
+        if (flag_32b) {
+            char *ld_args[] = {
+                (char*)"/usr/bin/ld", (char*)"-m", (char*)"elf_i386",
+                (char*)"-o", (char*)output, (char*)obj_out,
+                NULL
+            };
+            ret = spawn(ld_args);
+        } else {
+            char *ld_args[] = {
+                (char*)"neutron-ld", (char*)"-o", (char*)output,
+                (char*)obj_out, NULL
+            };
+            ret = linker_main(4, ld_args);
+        }
+    } else if (flag_32b) {
+        char crt0_32[512], prtf_32[512];
+        snprintf(crt0_32, sizeof crt0_32, "%s/crt0_32.o",   boot_dir);
+        snprintf(prtf_32, sizeof prtf_32, "%s/printf_32.o", boot_dir);
 
-    char *ld_args[] = { (char*)"neutron-ld", (char*)"-o", (char*)output,
-                        crt0, crti, crtn, prtf, (char*)obj_out, NULL };
-    ret = linker_main(8, ld_args);
+        char *ld_args[] = {
+            (char*)"/usr/bin/ld", (char*)"-m", (char*)"elf_i386",
+            (char*)"-o", (char*)output,
+            crt0_32, (char*)obj_out, prtf_32,
+            NULL
+        };
+        ret = spawn(ld_args);
+    } else {
+        char crt0[512], crti[512], crtn[512], prtf[512];
+        snprintf(crt0, sizeof crt0, "%s/crt0.o",   boot_dir);
+        snprintf(crti, sizeof crti, "%s/crti.o",   boot_dir);
+        snprintf(crtn, sizeof crtn, "%s/crtn.o",   boot_dir);
+        snprintf(prtf, sizeof prtf, "%s/printf.o", boot_dir);
+
+        char *ld_args[] = { (char*)"neutron-ld", (char*)"-o", (char*)output,
+                            crt0, crti, crtn, prtf, (char*)obj_out, NULL };
+        ret = linker_main(8, ld_args);
+    }
     unlink(obj_out);
     return ret;
 }

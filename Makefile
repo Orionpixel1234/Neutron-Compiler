@@ -45,10 +45,12 @@ NEUTRON    := $(BINDIR)/neutron
 NEUTRON_CC := $(BINDIR)/neutron-compiler
 NEUTRON_LD := $(BINDIR)/neutron-ld
 
-BOOT_OBJS  := $(BOOTDIR)/crt0.o   \
-              $(BOOTDIR)/crti.o   \
-              $(BOOTDIR)/crtn.o   \
-              $(BOOTDIR)/printf.o
+BOOT_OBJS  := $(BOOTDIR)/crt0.o     \
+              $(BOOTDIR)/crti.o     \
+              $(BOOTDIR)/crtn.o     \
+              $(BOOTDIR)/printf.o   \
+              $(BOOTDIR)/crt0_32.o  \
+              $(BOOTDIR)/printf_32.o
 
 all: $(NEUTRON) $(NEUTRON_CC) $(NEUTRON_LD) $(BOOT_OBJS)
 
@@ -104,6 +106,16 @@ $(BOOTDIR)/crtn.o: boot/crtn.asm | $(BOOTDIR)
 $(BOOTDIR)/printf.o: boot/printf.c | $(BOOTDIR)
 	$(CC) -std=c99 -nostdlib -fno-builtin -Os -c -o $@ $<
 	@echo "  CC  boot/printf.c"
+
+$(BOOTDIR)/crt0_32.o: boot/crt0_32.asm | $(BOOTDIR)
+	nasm -f elf32 boot/crt0_32.asm -o $@
+	@echo "  AS  boot/crt0_32.asm"
+
+GCC_INCLUDE := $(shell gcc -print-file-name=include)
+
+$(BOOTDIR)/printf_32.o: boot/printf_32.c | $(BOOTDIR)
+	$(CC) -std=c99 -m32 -nostdlib -nostdinc -I$(GCC_INCLUDE) -fno-builtin -Os -c -o $@ $<
+	@echo "  CC  boot/printf_32.c"
 
 # ---- Directory creation ----
 $(BINDIR):

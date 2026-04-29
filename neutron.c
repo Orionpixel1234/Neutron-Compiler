@@ -16,6 +16,14 @@
 #include <errno.h>
 
 /* ============================================================
+ * Global compilation flags
+ * ============================================================ */
+
+bool mode_32bit        = false;
+bool flag_freestanding = false;
+bool flag_nostdlib     = false;
+
+/* ============================================================
  * Global string literal table
  * ============================================================ */
 
@@ -63,21 +71,31 @@ static Type *make_basic(TyKind k, int size, int align) {
 }
 
 static void init_types(void) {
-    ty_void    = make_basic(TY_VOID,    0, 1);
-    ty_bool    = make_basic(TY_BOOL,    1, 1);
-    ty_char    = make_basic(TY_CHAR,    1, 1);
-    ty_uchar   = make_basic(TY_UCHAR,   1, 1);
-    ty_short   = make_basic(TY_SHORT,   2, 2);
-    ty_ushort  = make_basic(TY_USHORT,  2, 2);
-    ty_int     = make_basic(TY_INT,     4, 4);
-    ty_uint    = make_basic(TY_UINT,    4, 4);
-    ty_long    = make_basic(TY_LONG,    8, 8);   /* LP64 */
-    ty_ulong   = make_basic(TY_ULONG,   8, 8);
-    ty_llong   = make_basic(TY_LLONG,   8, 8);
-    ty_ullong  = make_basic(TY_ULLONG,  8, 8);
-    ty_float   = make_basic(TY_FLOAT,   4, 4);
-    ty_double  = make_basic(TY_DOUBLE,  8, 8);
-    ty_ldouble = make_basic(TY_LDOUBLE, 16, 16);
+    ty_void   = make_basic(TY_VOID,  0, 1);
+    ty_bool   = make_basic(TY_BOOL,  1, 1);
+    ty_char   = make_basic(TY_CHAR,  1, 1);
+    ty_uchar  = make_basic(TY_UCHAR, 1, 1);
+    ty_short  = make_basic(TY_SHORT,  2, 2);
+    ty_ushort = make_basic(TY_USHORT, 2, 2);
+    ty_int    = make_basic(TY_INT,  4, 4);
+    ty_uint   = make_basic(TY_UINT, 4, 4);
+    ty_float  = make_basic(TY_FLOAT,  4, 4);
+    ty_double = make_basic(TY_DOUBLE, 8, 8);
+    if (mode_32bit) {
+        /* i386 ILP32 ABI */
+        ty_long    = make_basic(TY_LONG,    4, 4);
+        ty_ulong   = make_basic(TY_ULONG,   4, 4);
+        ty_llong   = make_basic(TY_LLONG,   8, 4);  /* 8-byte, 4-aligned */
+        ty_ullong  = make_basic(TY_ULLONG,  8, 4);
+        ty_ldouble = make_basic(TY_LDOUBLE, 12, 4); /* x87 80-bit padded to 12 */
+    } else {
+        /* x86-64 LP64 ABI */
+        ty_long    = make_basic(TY_LONG,    8, 8);
+        ty_ulong   = make_basic(TY_ULONG,   8, 8);
+        ty_llong   = make_basic(TY_LLONG,   8, 8);
+        ty_ullong  = make_basic(TY_ULLONG,  8, 8);
+        ty_ldouble = make_basic(TY_LDOUBLE, 16, 16);
+    }
 }
 
 /* ============================================================
@@ -135,8 +153,8 @@ bool ty_is_void_ptr(const Type *t) {
 Type *ty_ptr_to(Type *base) {
     Type *t = xcalloc(1, sizeof *t);
     t->kind  = TY_PTR;
-    t->size  = 8;
-    t->align = 8;
+    t->size  = mode_32bit ? 4 : 8;
+    t->align = mode_32bit ? 4 : 8;
     t->base  = base;
     return t;
 }
@@ -360,27 +378,43 @@ static void usage(void) {
     fprintf(stderr,
         "Usage: neutron [options] <input.c> -o <output.s>\n"
         "Options:\n"
-        "  -o <file>       Write assembly to <file> (default: stdout)\n"
-        "  -E              Preprocess only\n"
-        "  -dump-tokens    Dump token stream\n"
-        "  -dump-ast       Dump AST\n"
-        "  -I <path>       Add include search path\n"
+        "  -o <file>          Write assembly to <file> (default: stdout)\n"
+        "  -m32               Target 32-bit i386 (cdecl ABI)\n"
+        "  -ffreestanding     Freestanding environment (no hosted include paths)\n"
+        "  -nostdlib          No standard library (implies -ffreestanding)\n"
+        "  -O0/-O1/-O2/-O3    Optimization level (accepted, currently no-op)\n"
+        "  -E                 Preprocess only\n"
+        "  -dump-tokens       Dump token stream\n"
+        "  -dump-ast          Dump AST\n"
+        "  -I <path>          Add include search path\n"
     );
     exit(1);
 }
 
 int compiler_main(int argc, char **argv) {
-    init_types();
-
     const char *input_file  = NULL;
     const char *output_file = NULL;
-    bool flag_E          = false;
+    bool flag_E           = false;
     bool flag_dump_tokens = false;
-    bool flag_dump_ast   = false;
+    bool flag_dump_ast    = false;
 
-    /* Default system include paths */
-    add_include_path("/usr/include");
-    add_include_path("/usr/local/include");
+    /* First pass: pick up mode flags so init_types() uses correct sizes */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-m32") == 0 || strcmp(argv[i], "-32b") == 0)
+            mode_32bit = true;
+        else if (strcmp(argv[i], "-ffreestanding") == 0)
+            flag_freestanding = true;
+        else if (strcmp(argv[i], "-nostdlib") == 0)
+            flag_nostdlib = flag_freestanding = true;
+    }
+
+    init_types();
+
+    /* Default hosted include paths — skipped in freestanding mode */
+    if (!flag_freestanding) {
+        add_include_path("/usr/include");
+        add_include_path("/usr/local/include");
+    }
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -397,6 +431,13 @@ int compiler_main(int argc, char **argv) {
             add_include_path(argv[i]);
         } else if (strncmp(argv[i], "-I", 2) == 0) {
             add_include_path(argv[i] + 2);
+        } else if (strcmp(argv[i], "-m32") == 0 || strcmp(argv[i], "-32b") == 0) {
+            /* already handled in first pass */
+        } else if (strcmp(argv[i], "-ffreestanding") == 0 ||
+                   strcmp(argv[i], "-nostdlib") == 0) {
+            /* already handled in first pass */
+        } else if (strncmp(argv[i], "-O", 2) == 0) {
+            /* optimization level — accepted, no-op for now */
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "neutron: unknown option '%s'\n", argv[i]);
             usage();

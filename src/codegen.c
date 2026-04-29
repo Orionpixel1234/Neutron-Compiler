@@ -1,25 +1,15 @@
 /*
- * codegen.c — x86-64 code generator for Neutron
+ * codegen.c — x86 code generator for Neutron
  *
- * Target:   Linux x86-64 (System V AMD64 ABI)
- * Output:   Intel syntax NASM-compatible assembly (.asm)
+ * 64-bit target: Linux x86-64  (System V AMD64 ABI)
+ * 32-bit target: Linux i386    (cdecl ABI)  — enabled by mode_32bit flag
  *
- * Strategy: single-pass AST walk; no IR.
- *   - Integers:  result always in rax (zero/sign-extended as needed).
- *   - Floats:    result always in xmm0.
- *   - Lvalues:   address in rax.
- *   - Binary ops: save left on stack, compute right, combine.
- *   - Calls:     push args in reverse, move first 6 into registers.
+ * 64-bit calling convention: first 6 int args in rdi/rsi/rdx/rcx/r8/r9
+ * 32-bit calling convention: all args pushed right-to-left (cdecl), caller cleans
  *
- * Register convention (caller-saved temporaries):
- *   rax   = accumulator / integer return value
- *   rcx   = right-hand operand (after pop), shift count
- *   rdx   = used by idiv (quotient remainder), compound assign scratch
- *   rdi rsi rdx rcx r8 r9  = integer argument registers
- *   xmm0  = float accumulator / float return value
- *   xmm1  = float scratch
- *
- * Callee-saved: rbp rbx r12–r15  (only rbp is used here)
+ * Integer result: rax / eax
+ * Float result:   xmm0  (SSE used in both modes)
+ * Lvalue address: rax / eax
  */
 
 #include "../neutron.h"
@@ -59,6 +49,32 @@ static const char *argregs_f[] = {
 static int frame_size;
 
 /* ============================================================
+ * Mode-dependent register names — set once in codegen()
+ * ============================================================ */
+
+static bool        m32;    /* copy of mode_32bit */
+static const char *Rax;   /* "rax"/"eax"  — accumulator        */
+static const char *Rcx;   /* "rcx"/"ecx"  — right-hand / shift */
+static const char *Rdx;   /* "rdx"/"edx"  — idiv remainder     */
+static const char *Rbp;   /* "rbp"/"ebp"  — frame pointer      */
+static const char *Rsp;   /* "rsp"/"esp"  — stack pointer      */
+static const char *Rdi;   /* "rdi"/"edi"  — zero-init scratch  */
+static const char *Rsw;   /* switch temp: "r10" or "esi"       */
+static int         Psize; /* pointer size in bytes: 8 or 4     */
+
+static void init_mode(void) {
+    m32   = mode_32bit;
+    Rax   = m32 ? "eax" : "rax";
+    Rcx   = m32 ? "ecx" : "rcx";
+    Rdx   = m32 ? "edx" : "rdx";
+    Rbp   = m32 ? "ebp" : "rbp";
+    Rsp   = m32 ? "esp" : "rsp";
+    Rdi   = m32 ? "edi" : "rdi";
+    Rsw   = m32 ? "esi" : "r10";
+    Psize = m32 ? 4 : 8;
+}
+
+/* ============================================================
  * Forward declarations
  * ============================================================ */
 
@@ -72,27 +88,28 @@ static void gen_decl  (Node *n);
  * ============================================================ */
 
 static void load(Type *t) {
-    if (!t) { E("mov rax, [rax]\n"); return; }
+    if (!t) { E("mov %s, [%s]\n", Rax, Rax); return; }
 
-    if (t->kind == TY_FLOAT)  { E("movss xmm0, [rax]\n"); return; }
+    if (t->kind == TY_FLOAT)
+        { E("movss xmm0, [%s]\n", Rax); return; }
     if (t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE)
-                               { E("movsd xmm0, [rax]\n"); return; }
+        { E("movsd xmm0, [%s]\n", Rax); return; }
 
     switch (t->size) {
     case 1:
-        if (ty_is_signed(t)) E("movsx rax, byte [rax]\n");
-        else                 E("movzx rax, byte [rax]\n");
+        if (ty_is_signed(t)) E("movsx %s, byte [%s]\n", Rax, Rax);
+        else                 E("movzx %s, byte [%s]\n", Rax, Rax);
         break;
     case 2:
-        if (ty_is_signed(t)) E("movsx rax, word [rax]\n");
-        else                 E("movzx rax, word [rax]\n");
+        if (ty_is_signed(t)) E("movsx %s, word [%s]\n", Rax, Rax);
+        else                 E("movzx %s, word [%s]\n", Rax, Rax);
         break;
     case 4:
-        if (ty_is_signed(t)) E("movsxd rax, dword [rax]\n");
-        else                 E("mov eax, [rax]\n");  /* zero-extends to rax */
+        if (!m32 && ty_is_signed(t)) E("movsxd rax, dword [rax]\n");
+        else                         E("mov %s, [%s]\n", Rax, Rax);
         break;
     default:
-        E("mov rax, [rax]\n");
+        E("mov %s, [%s]\n", Rax, Rax);
     }
 }
 
@@ -101,17 +118,18 @@ static void load(Type *t) {
  * ============================================================ */
 
 static void store(Type *t) {
-    if (!t) { E("mov [rcx], rax\n"); return; }
+    if (!t) { E("mov [%s], %s\n", Rcx, Rax); return; }
 
-    if (t->kind == TY_FLOAT)  { E("movss [rcx], xmm0\n"); return; }
+    if (t->kind == TY_FLOAT)
+        { E("movss [%s], xmm0\n", Rcx); return; }
     if (t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE)
-                               { E("movsd [rcx], xmm0\n"); return; }
+        { E("movsd [%s], xmm0\n", Rcx); return; }
 
     switch (t->size) {
-    case 1: E("mov byte  [rcx], al\n");   break;
-    case 2: E("mov word  [rcx], ax\n");   break;
-    case 4: E("mov dword [rcx], eax\n");  break;
-    default: E("mov [rcx], rax\n");       break;
+    case 1: E("mov byte  [%s], al\n",  Rcx); break;
+    case 2: E("mov word  [%s], ax\n",  Rcx); break;
+    case 4: E("mov dword [%s], eax\n", Rcx); break;
+    default: E("mov [%s], %s\n", Rcx, Rax); break;
     }
 }
 
@@ -122,11 +140,11 @@ static void store(Type *t) {
 static void extend_rax(Type *t) {
     if (!t) return;
     switch (t->kind) {
-    case TY_CHAR:   E("movsx  rax, al\n");    break;
-    case TY_UCHAR:  E("movzx  rax, al\n");    break;
-    case TY_SHORT:  E("movsx  rax, ax\n");    break;
-    case TY_USHORT: E("movzx  rax, ax\n");    break;
-    case TY_INT:    E("movsxd rax, eax\n");   break;
+    case TY_CHAR:   E("movsx  %s, al\n", Rax); break;
+    case TY_UCHAR:  E("movzx  %s, al\n", Rax); break;
+    case TY_SHORT:  E("movsx  %s, ax\n", Rax); break;
+    case TY_USHORT: E("movzx  %s, ax\n", Rax); break;
+    case TY_INT:    if (!m32) E("movsxd rax, eax\n"); break;
     default: break;
     }
 }
@@ -139,35 +157,42 @@ static void gen_lvalue(Node *n) {
     switch (n->kind) {
     case ND_IDENT:
         if (!n->sym) error_at(n->loc, "unresolved symbol '%s'", n->name);
-        if (n->sym->is_global || n->sym->is_static)
-            E("lea rax, [%s]\n", n->sym->asm_name);
-        else
-            E("lea rax, [rbp%+d]\n", n->sym->offset);
+        if (n->sym->is_global || n->sym->is_static) {
+            if (m32) E("mov %s, %s\n",         Rax, n->sym->asm_name);
+            else     E("lea %s, [%s]\n",        Rax, n->sym->asm_name);
+        } else {
+            if (m32) {
+                E("mov %s, %s\n", Rax, Rbp);
+                if (n->sym->offset) E("add %s, %d\n", Rax, n->sym->offset);
+            } else {
+                E("lea %s, [%s%+d]\n", Rax, Rbp, n->sym->offset);
+            }
+        }
         break;
 
     case ND_DEREF:
-        gen_expr(n->left);   /* pointer value → rax */
+        gen_expr(n->left);
         break;
 
     case ND_INDEX: {
         gen_lvalue(n->left);
-        E("push rax\n");
+        E("push %s\n", Rax);
         gen_expr(n->right);
-        int elem_sz = n->type ? n->type->size : 8;
-        if (elem_sz != 1) E("imul rax, %d\n", elem_sz);
-        E("pop rcx\n");
-        E("add rax, rcx\n");
+        int elem_sz = n->type ? n->type->size : Psize;
+        if (elem_sz != 1) E("imul %s, %d\n", Rax, elem_sz);
+        E("pop %s\n", Rcx);
+        E("add %s, %s\n", Rax, Rcx);
         break;
     }
 
     case ND_MEMBER:
         gen_lvalue(n->left);
-        if (n->member) E("add rax, %d\n", n->member->offset);
+        if (n->member) E("add %s, %d\n", Rax, n->member->offset);
         break;
 
     case ND_ARROW:
         gen_expr(n->left);
-        if (n->member) E("add rax, %d\n", n->member->offset);
+        if (n->member) E("add %s, %d\n", Rax, n->member->offset);
         break;
 
     default:
@@ -187,7 +212,7 @@ static void gen_expr(Node *n) {
 
     /* ---- Literals ---- */
     case ND_INT_LIT:
-        E("mov rax, %lld\n", (long long)n->ival);
+        E("mov %s, %lld\n", Rax, (long long)n->ival);
         return;
 
     case ND_FLOAT_LIT:
@@ -196,6 +221,15 @@ static void gen_expr(Node *n) {
             v.f = (float)n->fval;
             E("mov eax, 0x%08X\n", v.u);
             E("movd xmm0, eax\n");
+        } else if (m32) {
+            /* 32-bit: load 8-byte double via stack */
+            union { double d; struct { uint32_t lo, hi; } p; } v;
+            v.d = (double)n->fval;
+            E("sub %s, 8\n", Rsp);
+            E("mov dword [%s],   0x%08X\n", Rsp, v.p.lo);
+            E("mov dword [%s+4], 0x%08X\n", Rsp, v.p.hi);
+            E("movsd xmm0, [%s]\n", Rsp);
+            E("add %s, 8\n", Rsp);
         } else {
             union { double d; uint64_t u; } v;
             v.d = (double)n->fval;
@@ -205,7 +239,8 @@ static void gen_expr(Node *n) {
         return;
 
     case ND_STR_LIT:
-        E("lea rax, [.Lstr%d]\n", n->str_id);
+        if (m32) E("mov %s, .Lstr%d\n", Rax, n->str_id);
+        else     E("lea %s, [.Lstr%d]\n", Rax, n->str_id);
         return;
 
     /* ---- Identifier (rvalue) ---- */
@@ -241,28 +276,35 @@ static void gen_expr(Node *n) {
                 E("mov eax, 0x80000000\n");
                 E("movd xmm1, eax\n");
                 E("xorps xmm0, xmm1\n");
+            } else if (m32) {
+                E("sub %s, 8\n", Rsp);
+                E("mov dword [%s],   0x00000000\n", Rsp);
+                E("mov dword [%s+4], 0x80000000\n", Rsp);
+                E("movsd xmm1, [%s]\n", Rsp);
+                E("add %s, 8\n", Rsp);
+                E("xorpd xmm0, xmm1\n");
             } else {
                 E("mov rax, 0x8000000000000000\n");
                 E("movq xmm1, rax\n");
                 E("xorpd xmm0, xmm1\n");
             }
         } else {
-            E("neg rax\n");
+            E("neg %s\n", Rax);
         }
         return;
 
     /* ---- Logical not ---- */
     case ND_NOT:
         gen_expr(n->left);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("sete al\n");
-        E("movzx rax, al\n");
+        E("movzx %s, al\n", Rax);
         return;
 
     /* ---- Bitwise not ---- */
     case ND_BITNOT:
         gen_expr(n->left);
-        E("not rax\n");
+        E("not %s\n", Rax);
         return;
 
     /* ---- Cast ---- */
@@ -273,13 +315,13 @@ static void gen_expr(Node *n) {
         if (!from || !to) return;
 
         if (ty_is_float(from) && ty_is_integer(to)) {
-            if (from->kind == TY_FLOAT) E("cvttss2si rax, xmm0\n");
-            else                        E("cvttsd2si rax, xmm0\n");
+            if (from->kind == TY_FLOAT) E("cvttss2si %s, xmm0\n", Rax);
+            else                        E("cvttsd2si %s, xmm0\n", Rax);
             return;
         }
         if (ty_is_integer(from) && ty_is_float(to)) {
-            if (to->kind == TY_FLOAT) E("cvtsi2ss xmm0, rax\n");
-            else                      E("cvtsi2sd xmm0, rax\n");
+            if (to->kind == TY_FLOAT) E("cvtsi2ss xmm0, %s\n", Rax);
+            else                      E("cvtsi2sd xmm0, %s\n", Rax);
             return;
         }
         if (ty_is_float(from) && ty_is_float(to)) {
@@ -300,12 +342,12 @@ static void gen_expr(Node *n) {
         if (n->left->type && ty_is_pointer(n->left->type))
             delta = n->left->type->base ? n->left->type->base->size : 1;
         gen_lvalue(n->left);
-        E("mov rcx, rax\n");   /* save address */
+        E("mov %s, %s\n", Rcx, Rax);
         load(n->left->type);
-        if (n->kind == ND_PRE_INC) E("add rax, %d\n", delta);
-        else                       E("sub rax, %d\n", delta);
+        if (n->kind == ND_PRE_INC) E("add %s, %d\n", Rax, delta);
+        else                       E("sub %s, %d\n", Rax, delta);
         store(n->left->type);
-        E("mov rax, rcx\n");
+        E("mov %s, %s\n", Rax, Rcx);
         load(n->left->type);
         return;
     }
@@ -317,25 +359,25 @@ static void gen_expr(Node *n) {
         if (n->left->type && ty_is_pointer(n->left->type))
             delta = n->left->type->base ? n->left->type->base->size : 1;
         gen_lvalue(n->left);
-        E("mov rcx, rax\n");
+        E("mov %s, %s\n", Rcx, Rax);
         load(n->left->type);
-        E("push rax\n");       /* save old value */
-        if (n->kind == ND_POST_INC) E("add rax, %d\n", delta);
-        else                        E("sub rax, %d\n", delta);
+        E("push %s\n", Rax);
+        if (n->kind == ND_POST_INC) E("add %s, %d\n", Rax, delta);
+        else                        E("sub %s, %d\n", Rax, delta);
         store(n->left->type);
-        E("pop rcx\n");
-        E("mov rax, rcx\n");   /* return old value */
+        E("pop %s\n", Rcx);
+        E("mov %s, %s\n", Rax, Rcx);
         return;
     }
 
     /* ---- Assignment ---- */
     case ND_ASSIGN: {
         gen_lvalue(n->left);
-        E("push rax\n");        /* save lvalue address */
+        E("push %s\n", Rax);
         gen_expr(n->right);
-        E("pop rcx\n");         /* restore lvalue address → rcx */
+        E("pop %s\n", Rcx);
         store(n->left->type);
-        E("mov rax, rcx\n");
+        E("mov %s, %s\n", Rax, Rcx);
         load(n->left->type);
         return;
     }
@@ -343,35 +385,38 @@ static void gen_expr(Node *n) {
     /* ---- Compound assignment (+=, -=, ...) ---- */
     case ND_ASSIGN_OP: {
         gen_lvalue(n->left);
-        E("push rax\n");        /* [1] save lvalue address */
+        E("push %s\n", Rax);
         load(n->left->type);
-        E("push rax\n");        /* [2] save old value */
+        E("push %s\n", Rax);
         gen_expr(n->right);
-        E("pop rcx\n");         /* [2] old value → rcx;  rax = RHS */
-        E("xchg rax, rcx\n");   /*     rax = old value,  rcx = RHS */
+        E("pop %s\n", Rcx);
+        E("xchg %s, %s\n", Rax, Rcx);
 
         switch (n->op) {
-        case TK_PLUS_EQ:    E("add  rax, rcx\n");  break;
-        case TK_MINUS_EQ:   E("sub  rax, rcx\n");  break;
-        case TK_STAR_EQ:    E("imul rax, rcx\n");  break;
-        case TK_SLASH_EQ:   E("cqo\n"); E("idiv rcx\n"); break;
-        case TK_PERCENT_EQ: E("cqo\n"); E("idiv rcx\n"); E("mov rax, rdx\n"); break;
-        case TK_AMP_EQ:     E("and  rax, rcx\n");  break;
-        case TK_PIPE_EQ:    E("or   rax, rcx\n");  break;
-        case TK_CARET_EQ:   E("xor  rax, rcx\n");  break;
-        /* shift: count must be in cl */
-        case TK_LSHIFT_EQ:  E("shl  rax, cl\n");   break;
+        case TK_PLUS_EQ:    E("add  %s, %s\n", Rax, Rcx); break;
+        case TK_MINUS_EQ:   E("sub  %s, %s\n", Rax, Rcx); break;
+        case TK_STAR_EQ:    E("imul %s, %s\n", Rax, Rcx); break;
+        case TK_SLASH_EQ:
+            if (m32) { E("cdq\n"); } else { E("cqo\n"); }
+            E("idiv %s\n", Rcx); break;
+        case TK_PERCENT_EQ:
+            if (m32) { E("cdq\n"); } else { E("cqo\n"); }
+            E("idiv %s\n", Rcx); E("mov %s, %s\n", Rax, Rdx); break;
+        case TK_AMP_EQ:     E("and  %s, %s\n", Rax, Rcx); break;
+        case TK_PIPE_EQ:    E("or   %s, %s\n", Rax, Rcx); break;
+        case TK_CARET_EQ:   E("xor  %s, %s\n", Rax, Rcx); break;
+        case TK_LSHIFT_EQ:  E("shl  %s, cl\n", Rax); break;
         case TK_RSHIFT_EQ:
             if (n->left->type && ty_is_signed(n->left->type))
-                             E("sar  rax, cl\n");
-            else             E("shr  rax, cl\n");
+                             E("sar  %s, cl\n", Rax);
+            else             E("shr  %s, cl\n", Rax);
             break;
         default: break;
         }
 
-        E("pop rcx\n");         /* [1] lvalue address */
+        E("pop %s\n", Rcx);
         store(n->left->type);
-        E("mov rax, rcx\n");
+        E("mov %s, %s\n", Rax, Rcx);
         load(n->left->type);
         return;
     }
@@ -381,18 +426,15 @@ static void gen_expr(Node *n) {
     case ND_SHL: case ND_SHR: case ND_BITAND: case ND_BITXOR: case ND_BITOR: {
         bool is_flt = n->type && ty_is_float(n->type);
 
-        /* Evaluate left; save it */
         gen_expr(n->left);
-        if (is_flt) { E("sub rsp, 8\n"); E("movsd [rsp], xmm0\n"); }
-        else        { E("push rax\n"); }
+        if (is_flt) { E("sub %s, 8\n", Rsp); E("movsd [%s], xmm0\n", Rsp); }
+        else        { E("push %s\n", Rax); }
 
-        /* Evaluate right */
         gen_expr(n->right);
 
         if (is_flt) {
-            /* xmm1 = left,  xmm0 = right */
-            E("movsd xmm1, [rsp]\n");
-            E("add rsp, 8\n");
+            E("movsd xmm1, [%s]\n", Rsp);
+            E("add %s, 8\n", Rsp);
             bool single = (n->type->kind == TY_FLOAT);
             switch (n->kind) {
             case ND_ADD: fprintf(OUT, "\t%s xmm1, xmm0\n", single ? "addss" : "addsd"); break;
@@ -405,48 +447,44 @@ static void gen_expr(Node *n) {
             return;
         }
 
-        /* rcx = left,  rax = right */
-        E("pop rcx\n");
+        E("pop %s\n", Rcx);
 
         switch (n->kind) {
         case ND_ADD:
-            E("add rax, rcx\n");
+            E("add %s, %s\n", Rax, Rcx);
             break;
         case ND_SUB:
-            /* left - right = rcx - rax */
-            E("sub rcx, rax\n");
-            E("mov rax, rcx\n");
+            E("sub %s, %s\n", Rcx, Rax);
+            E("mov %s, %s\n", Rax, Rcx);
             break;
         case ND_MUL:
-            E("imul rax, rcx\n");
+            E("imul %s, %s\n", Rax, Rcx);
             break;
         case ND_DIV:
-            /* rax = rcx / rax */
-            E("xchg rax, rcx\n");
-            E("cqo\n");
-            E("idiv rcx\n");
+            E("xchg %s, %s\n", Rax, Rcx);
+            if (m32) { E("cdq\n"); } else { E("cqo\n"); }
+            E("idiv %s\n", Rcx);
             break;
         case ND_MOD:
-            E("xchg rax, rcx\n");
-            E("cqo\n");
-            E("idiv rcx\n");
-            E("mov rax, rdx\n");
+            E("xchg %s, %s\n", Rax, Rcx);
+            if (m32) { E("cdq\n"); } else { E("cqo\n"); }
+            E("idiv %s\n", Rcx);
+            E("mov %s, %s\n", Rax, Rdx);
             break;
         case ND_SHL:
-            /* rax = rcx << rax  →  swap, put count in cl */
-            E("xchg rax, rcx\n");
-            E("shl rax, cl\n");
+            E("xchg %s, %s\n", Rax, Rcx);
+            E("shl %s, cl\n", Rax);
             break;
         case ND_SHR:
-            E("xchg rax, rcx\n");
+            E("xchg %s, %s\n", Rax, Rcx);
             if (n->left->type && ty_is_signed(n->left->type))
-                E("sar rax, cl\n");
+                E("sar %s, cl\n", Rax);
             else
-                E("shr rax, cl\n");
+                E("shr %s, cl\n", Rax);
             break;
-        case ND_BITAND: E("and rax, rcx\n"); break;
-        case ND_BITXOR: E("xor rax, rcx\n"); break;
-        case ND_BITOR:  E("or  rax, rcx\n"); break;
+        case ND_BITAND: E("and %s, %s\n", Rax, Rcx); break;
+        case ND_BITXOR: E("xor %s, %s\n", Rax, Rcx); break;
+        case ND_BITOR:  E("or  %s, %s\n", Rax, Rcx); break;
         default: break;
         }
         return;
@@ -458,18 +496,18 @@ static void gen_expr(Node *n) {
         bool is_flt = n->left->type && ty_is_float(n->left->type);
 
         gen_expr(n->left);
-        if (is_flt) { E("sub rsp, 8\n"); E("movsd [rsp], xmm0\n"); }
-        else        { E("push rax\n"); }
+        if (is_flt) { E("sub %s, 8\n", Rsp); E("movsd [%s], xmm0\n", Rsp); }
+        else        { E("push %s\n", Rax); }
 
         gen_expr(n->right);
 
         if (is_flt) {
-            E("movsd xmm1, [rsp]\n");
-            E("add rsp, 8\n");
-            E("ucomisd xmm1, xmm0\n");  /* xmm1 = left,  xmm0 = right */
+            E("movsd xmm1, [%s]\n", Rsp);
+            E("add %s, 8\n", Rsp);
+            E("ucomisd xmm1, xmm0\n");
         } else {
-            E("pop rcx\n");
-            E("cmp rcx, rax\n");         /* rcx = left,  rax = right */
+            E("pop %s\n", Rcx);
+            E("cmp %s, %s\n", Rcx, Rax);
         }
 
         const char *setcc = "sete";
@@ -483,7 +521,7 @@ static void gen_expr(Node *n) {
         default: break;
         }
         E("%s al\n", setcc);
-        E("movzx rax, al\n");
+        E("movzx %s, al\n", Rax);
         return;
     }
 
@@ -491,15 +529,15 @@ static void gen_expr(Node *n) {
     case ND_LOGAND: {
         int lfalse = new_label(), lend = new_label();
         gen_expr(n->left);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("je  .L%d\n", lfalse);
         gen_expr(n->right);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("je  .L%d\n", lfalse);
-        E("mov rax, 1\n");
+        E("mov %s, 1\n", Rax);
         E("jmp .L%d\n", lend);
         emit_label(lfalse);
-        E("mov rax, 0\n");
+        E("mov %s, 0\n", Rax);
         emit_label(lend);
         return;
     }
@@ -508,15 +546,15 @@ static void gen_expr(Node *n) {
     case ND_LOGOR: {
         int ltrue = new_label(), lend = new_label();
         gen_expr(n->left);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("jne .L%d\n", ltrue);
         gen_expr(n->right);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("jne .L%d\n", ltrue);
-        E("mov rax, 0\n");
+        E("mov %s, 0\n", Rax);
         E("jmp .L%d\n", lend);
         emit_label(ltrue);
-        E("mov rax, 1\n");
+        E("mov %s, 1\n", Rax);
         emit_label(lend);
         return;
     }
@@ -525,7 +563,7 @@ static void gen_expr(Node *n) {
     case ND_TERNARY: {
         int lelse = new_label(), lend = new_label();
         gen_expr(n->cond);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("je  .L%d\n", lelse);
         gen_expr(n->then);
         E("jmp .L%d\n", lend);
@@ -545,47 +583,72 @@ static void gen_expr(Node *n) {
     case ND_CALL: {
         int n_args = n->n_args;
 
-        /* Push all args right-to-left */
-        for (int i = n_args - 1; i >= 0; i--) {
-            Node *arg = n->args[i];
-            gen_expr(arg);
-            if (arg->type && ty_is_float(arg->type)) {
-                E("sub rsp, 8\n");
-                E("movsd [rsp], xmm0\n");
-            } else {
-                E("push rax\n");
+        if (m32) {
+            /* 32-bit cdecl: push all args right-to-left; caller cleans up */
+            int total_bytes = 0;
+            for (int i = n_args - 1; i >= 0; i--) {
+                Node *arg = n->args[i];
+                gen_expr(arg);
+                if (arg->type && ty_is_float(arg->type)) {
+                    if (arg->type->kind == TY_FLOAT) {
+                        E("sub esp, 4\n");
+                        E("movss [esp], xmm0\n");
+                        total_bytes += 4;
+                    } else {
+                        E("sub esp, 8\n");
+                        E("movsd [esp], xmm0\n");
+                        total_bytes += 8;
+                    }
+                } else {
+                    E("push eax\n");
+                    total_bytes += 4;
+                }
             }
-        }
-
-        /* Move first 6 args from stack into registers */
-        int i_reg = 0, f_reg = 0;
-        for (int i = 0; i < n_args && i < 6; i++) {
-            Node *arg = n->args[i];
-            if (arg->type && ty_is_float(arg->type)) {
-                if (f_reg < 8) E("movsd %s, [rsp]\n", argregs_f[f_reg++]);
-                E("add rsp, 8\n");
-            } else {
-                if (i_reg < 6) E("mov %s, [rsp]\n", argregs_i[i_reg++]);
-                E("add rsp, 8\n");
+            if (n->callee->kind == ND_IDENT && n->callee->sym)
+                E("call %s\n", n->callee->sym->asm_name);
+            else {
+                gen_expr(n->callee);
+                E("call eax\n");
             }
+            if (total_bytes > 0) E("add esp, %d\n", total_bytes);
+        } else {
+            /* 64-bit SysV AMD64: first 6 int in regs, first 8 float in xmm */
+            for (int i = n_args - 1; i >= 0; i--) {
+                Node *arg = n->args[i];
+                gen_expr(arg);
+                if (arg->type && ty_is_float(arg->type)) {
+                    E("sub rsp, 8\n");
+                    E("movsd [rsp], xmm0\n");
+                } else {
+                    E("push rax\n");
+                }
+            }
+
+            int i_reg = 0, f_reg = 0;
+            for (int i = 0; i < n_args && i < 6; i++) {
+                Node *arg = n->args[i];
+                if (arg->type && ty_is_float(arg->type)) {
+                    if (f_reg < 8) E("movsd %s, [rsp]\n", argregs_f[f_reg++]);
+                    E("add rsp, 8\n");
+                } else {
+                    if (i_reg < 6) E("mov %s, [rsp]\n", argregs_i[i_reg++]);
+                    E("add rsp, 8\n");
+                }
+            }
+
+            E("and rsp, -16\n");
+            E("mov rax, %d\n", f_reg);
+
+            if (n->callee->kind == ND_IDENT && n->callee->sym)
+                E("call %s\n", n->callee->sym->asm_name);
+            else {
+                gen_expr(n->callee);
+                E("call rax\n");
+            }
+
+            int extra = n_args > 6 ? (n_args - 6) : 0;
+            if (extra > 0) E("add rsp, %d\n", extra * 8);
         }
-
-        /* Align stack to 16 bytes before call */
-        E("and rsp, -16\n");
-
-        /* rax = number of float args (required for variadic functions) */
-        E("mov rax, %d\n", f_reg);
-
-        if (n->callee->kind == ND_IDENT && n->callee->sym)
-            E("call %s\n", n->callee->sym->asm_name);
-        else {
-            gen_expr(n->callee);
-            E("call rax\n");
-        }
-
-        /* Pop any stack-only args (beyond first 6) */
-        int extra = n_args > 6 ? (n_args - 6) : 0;
-        if (extra > 0) E("add rsp, %d\n", extra * 8);
         return;
     }
 
@@ -637,7 +700,7 @@ static void gen_stmt(Node *n) {
     case ND_IF: {
         int lelse = new_label(), lend = new_label();
         gen_expr(n->cond);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("je  .L%d\n", lelse);
         gen_stmt(n->then);
         E("jmp .L%d\n", lend);
@@ -652,7 +715,7 @@ static void gen_stmt(Node *n) {
         push_break(lend); push_continue(lcond);
         emit_label(lcond);
         gen_expr(n->cond);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("je  .L%d\n", lend);
         gen_stmt(n->body);
         E("jmp .L%d\n", lcond);
@@ -667,7 +730,7 @@ static void gen_stmt(Node *n) {
         emit_label(lbody);
         gen_stmt(n->body);
         gen_expr(n->cond);
-        E("cmp rax, 0\n");
+        E("cmp %s, 0\n", Rax);
         E("jne .L%d\n", lbody);
         emit_label(lend);
         pop_break(); pop_continue();
@@ -686,7 +749,7 @@ static void gen_stmt(Node *n) {
         emit_label(lcond);
         if (n->cond) {
             gen_expr(n->cond);
-            E("cmp rax, 0\n");
+            E("cmp %s, 0\n", Rax);
             E("je  .L%d\n", lend);
         }
         gen_stmt(n->body);
@@ -703,7 +766,7 @@ static void gen_stmt(Node *n) {
         push_break(lend);
 
         gen_expr(n->cond);
-        E("mov r10, rax\n");    /* save switch value in r10 */
+        E("mov %s, %s\n", Rsw, Rax);    /* save switch value */
 
         /* Collect case values from direct children of body block */
         typedef struct { long long val; int lbl; } CaseEntry;
@@ -729,7 +792,7 @@ static void gen_stmt(Node *n) {
 
         /* Emit comparison chain */
         for (int i = 0; i < n_cases; i++) {
-            E("cmp r10, %lld\n", cases[i].val);
+            E("cmp %s, %lld\n", Rsw, cases[i].val);
             E("je  .L%d\n", cases[i].lbl);
         }
         E("jmp .L%d\n", default_lbl);
@@ -752,8 +815,8 @@ static void gen_stmt(Node *n) {
 
     case ND_RETURN:
         if (n->left) gen_expr(n->left);
-        E("mov rsp, rbp\n");
-        E("pop rbp\n");
+        E("mov %s, %s\n", Rsp, Rbp);
+        E("pop %s\n", Rbp);
         E("ret\n");
         return;
 
@@ -817,7 +880,8 @@ static void gen_global_init(Node *n, Type *type, const char *sym_name) {
         return;
     }
     case ND_STR_LIT:
-        EL("\tdq .Lstr%d\n", n->str_id);
+        if (m32) EL("\tdd .Lstr%d\n", n->str_id);
+        else     EL("\tdq .Lstr%d\n", n->str_id);
         return;
     case ND_INIT_LIST:
         if (type && (type->kind == TY_STRUCT || type->kind == TY_UNION)) {
@@ -852,22 +916,47 @@ static void gen_decl(Node *n) {
         emit_named(n->sym->asm_name);
 
         /* Prologue */
-        E("push rbp\n");
-        E("mov  rbp, rsp\n");
+        E("push %s\n", Rbp);
+        E("mov  %s, %s\n", Rbp, Rsp);
         frame_size = n->offset;
-        if (frame_size > 0) E("sub rsp, %d\n", frame_size);
+        if (frame_size > 0) E("sub %s, %d\n", Rsp, frame_size);
 
-        /* Copy register arguments to their stack homes */
-        int i_reg = 0, f_reg = 0;
-        for (int i = 0; i < n->n_params; i++) {
-            Node *pn = n->params[i];
-            if (!pn->type) continue;
-            if (ty_is_float(pn->type)) {
-                if (f_reg < 8)
-                    E("movsd [rbp%+d], %s\n", pn->offset, argregs_f[f_reg++]);
-            } else {
-                if (i_reg < 6)
-                    E("mov [rbp%+d], %s\n", pn->offset, argregs_i[i_reg++]);
+        /* Copy arguments to their stack homes */
+        if (m32) {
+            /* 32-bit cdecl: args are at [ebp+8], [ebp+12], ... */
+            int stack_off = 8;
+            for (int i = 0; i < n->n_params; i++) {
+                Node *pn = n->params[i];
+                if (!pn->type) { stack_off += 4; continue; }
+                if (ty_is_float(pn->type)) {
+                    int fsz = (pn->type->kind == TY_FLOAT) ? 4 : 8;
+                    if (pn->type->kind == TY_FLOAT) {
+                        E("movss xmm0, [ebp+%d]\n", stack_off);
+                        E("movss [ebp%+d], xmm0\n", pn->offset);
+                    } else {
+                        E("movsd xmm0, [ebp+%d]\n", stack_off);
+                        E("movsd [ebp%+d], xmm0\n", pn->offset);
+                    }
+                    stack_off += fsz;
+                } else {
+                    E("mov eax, [ebp+%d]\n", stack_off);
+                    E("mov [ebp%+d], eax\n", pn->offset);
+                    stack_off += 4;
+                }
+            }
+        } else {
+            /* 64-bit SysV: first 6 int in regs, first 8 float in xmm */
+            int i_reg = 0, f_reg = 0;
+            for (int i = 0; i < n->n_params; i++) {
+                Node *pn = n->params[i];
+                if (!pn->type) continue;
+                if (ty_is_float(pn->type)) {
+                    if (f_reg < 8)
+                        E("movsd [rbp%+d], %s\n", pn->offset, argregs_f[f_reg++]);
+                } else {
+                    if (i_reg < 6)
+                        E("mov [rbp%+d], %s\n", pn->offset, argregs_i[i_reg++]);
+                }
             }
         }
 
@@ -875,9 +964,9 @@ static void gen_decl(Node *n) {
         gen_stmt(n->body);
 
         /* Default return 0 (reachable when function has no explicit return) */
-        E("mov rax, 0\n");
-        E("mov rsp, rbp\n");
-        E("pop rbp\n");
+        E("mov %s, 0\n", Rax);
+        E("mov %s, %s\n", Rsp, Rbp);
+        E("pop %s\n", Rbp);
         E("ret\n");
         return;
     }
@@ -892,18 +981,29 @@ static void gen_decl(Node *n) {
             /* Local variable */
             if (n->init_expr) {
                 gen_expr(n->init_expr);
-                E("lea rcx, [rbp%+d]\n", n->sym->offset);
+                if (m32) {
+                    E("mov %s, %s\n", Rcx, Rbp);
+                    if (n->sym->offset) E("add %s, %d\n", Rcx, n->sym->offset);
+                } else {
+                    E("lea %s, [%s%+d]\n", Rcx, Rbp, n->sym->offset);
+                }
                 store(n->type);
             } else if (n->type && n->type->size > 0) {
                 /* Zero-initialise */
-                E("lea rdi, [rbp%+d]\n", n->sym->offset);
-                E("mov rax, 0\n");
-                for (int b = 0; b < n->type->size; b += 8) {
+                if (m32) {
+                    E("mov %s, %s\n", Rdi, Rbp);
+                    if (n->sym->offset) E("add %s, %d\n", Rdi, n->sym->offset);
+                } else {
+                    E("lea %s, [%s%+d]\n", Rdi, Rbp, n->sym->offset);
+                }
+                E("mov %s, 0\n", Rax);
+                int stride = m32 ? 4 : 8;
+                for (int b = 0; b < n->type->size; b += stride) {
                     int rem = n->type->size - b;
-                    if      (rem >= 8) E("mov qword [rdi+%d], rax\n", b);
-                    else if (rem >= 4) E("mov dword [rdi+%d], eax\n", b);
-                    else if (rem >= 2) E("mov word  [rdi+%d], ax\n",  b);
-                    else               E("mov byte  [rdi+%d], al\n",  b);
+                    if      (rem >= 8 && !m32) E("mov qword [%s+%d], %s\n", Rdi, b, Rax);
+                    else if (rem >= 4) E("mov dword [%s+%d], eax\n", Rdi, b);
+                    else if (rem >= 2) E("mov word  [%s+%d], ax\n",  Rdi, b);
+                    else               E("mov byte  [%s+%d], al\n",  Rdi, b);
                 }
             }
             return;
@@ -1028,6 +1128,7 @@ static void collect_externs_node(Node *n) {
 void codegen(Node *prog, FILE *out) {
     OUT       = out;
     label_cnt = 0;
+    init_mode();
 
     /* Collect extern symbols used by this translation unit */
     n_extern_syms = 0;
@@ -1036,8 +1137,12 @@ void codegen(Node *prog, FILE *out) {
 
     /* File header */
     EL("; Generated by Neutron Compiler\n");
-    EL("[bits 64]\n");
-    EL("[default rel]\n\n");   /* all bare label refs become RIP-relative */
+    if (m32) {
+        EL("[bits 32]\n\n");
+    } else {
+        EL("[bits 64]\n");
+        EL("[default rel]\n\n");
+    }
 
     /* Extern declarations (for linker) */
     for (int i = 0; i < n_extern_syms; i++)

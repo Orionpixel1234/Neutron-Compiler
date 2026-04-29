@@ -710,6 +710,8 @@ static Node *parse_cast(Parser *p) {
                      next->kind == TK_SIGNED || next->kind == TK__BOOL ||
                      next->kind == TK_STRUCT || next->kind == TK_UNION ||
                      next->kind == TK_ENUM ||
+                     next->kind == TK_CONST || next->kind == TK_VOLATILE ||
+                     next->kind == TK_RESTRICT ||
                      (next->kind == TK_IDENT && td_is_typedef(next->sval)))) {
             SrcLoc loc = peek(p)->loc;
             advance(p);  /* ( */

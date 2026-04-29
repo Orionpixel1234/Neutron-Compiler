@@ -400,6 +400,11 @@ Node *new_unary     (NK kind, Node *operand, SrcLoc loc);
 Node *new_int_lit   (long long val, SrcLoc loc);
 Node *new_float_lit (long double val, SrcLoc loc);
 
+/* Global compilation flags */
+extern bool mode_32bit;        /* -m32 / -32b: emit 32-bit cdecl assembly     */
+extern bool flag_freestanding; /* -ffreestanding: no hosted-env include paths  */
+extern bool flag_nostdlib;     /* -nostdlib: skip crt0/boot objects at link    */
+
 /* Driver entry points */
 int compiler_main(int argc, char **argv);
 int linker_main  (int argc, char **argv);
