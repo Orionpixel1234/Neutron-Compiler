@@ -1,2 +1,2 @@
-# Neutron (TM) Compiler
+# Neutron Compiler
 A Compiler for all your needs
